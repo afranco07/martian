@@ -211,6 +211,27 @@ func (c *Config) TLSForHost(hostname string) *tls.Config {
 	}
 }
 
+// TLSForIP returns a *tls.Config that will generate certificates on-the-fly
+// using SNI from the connection, or fall back to the connections remote IP.
+func (c *Config) TLSForIP() *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: c.skipVerify,
+		GetCertificate: func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			host := clientHello.ServerName
+			if host == "" {
+				ip, _, err := net.SplitHostPort(clientHello.Conn.RemoteAddr().String())
+				if err != nil {
+					return nil, errors.New("mitm: SNI not provided, and couldn't get remote addr, failed to build certificate")
+				}
+				host = ip
+			}
+
+			return c.cert(host)
+		},
+		NextProtos: []string{"http/1.1"},
+	}
+}
+
 func (c *Config) cert(hostname string) (*tls.Certificate, error) {
 	// Remove the port if it exists.
 	host, _, err := net.SplitHostPort(hostname)
