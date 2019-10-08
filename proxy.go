@@ -25,8 +25,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
-	"sync"
 	"time"
+	gocontext "context"
 
 	"github.com/google/martian/v3/log"
 	"github.com/google/martian/v3/mitm"
@@ -34,6 +34,8 @@ import (
 	"github.com/google/martian/v3/proxyutil"
 	"github.com/google/martian/v3/trafficshape"
 )
+
+type SessionModifier func(*Session) error
 
 var errClose = errors.New("closing connection")
 var noop = Noop("martian")
@@ -54,13 +56,10 @@ func isCloseable(err error) bool {
 // Proxy is an HTTP proxy with support for TLS MITM and customizable behavior.
 type Proxy struct {
 	roundTripper http.RoundTripper
-	dial         func(string, string) (net.Conn, error)
+	dialContext  func(gocontext.Context, string, string) (net.Conn, error)
 	timeout      time.Duration
 	mitm         *mitm.Config
 	proxyURL     *url.URL
-	conns        sync.WaitGroup
-	connsMu      sync.Mutex // protects conns.Add/Wait from concurrent access
-	closing      chan bool
 
 	reqmod RequestModifier
 	resmod ResponseModifier
@@ -78,14 +77,13 @@ func NewProxy() *Proxy {
 			ExpectContinueTimeout: time.Second,
 		},
 		timeout: 5 * time.Minute,
-		closing: make(chan bool),
 		reqmod:  noop,
 		resmod:  noop,
 	}
-	proxy.SetDial((&net.Dialer{
+	proxy.SetDialContext((&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-	}).Dial)
+	}).DialContext)
 	return proxy
 }
 
@@ -96,7 +94,7 @@ func (p *Proxy) SetRoundTripper(rt http.RoundTripper) {
 	if tr, ok := p.roundTripper.(*http.Transport); ok {
 		tr.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
 		tr.Proxy = http.ProxyURL(p.proxyURL)
-		tr.Dial = p.dial
+		tr.DialContext = p.dialContext
 	}
 }
 
@@ -122,14 +120,21 @@ func (p *Proxy) SetMITM(config *mitm.Config) {
 
 // SetDial sets the dial func used to establish a connection.
 func (p *Proxy) SetDial(dial func(string, string) (net.Conn, error)) {
-	p.dial = func(a, b string) (net.Conn, error) {
-		c, e := dial(a, b)
+	p.SetDialContext(func(ctx gocontext.Context, a, b string) (net.Conn, error) {
+		return dial(a, b)
+	})
+}
+
+// SetDialContext sets the dial func used to establish a connection.
+func (p *Proxy) SetDialContext(dialContext func(gocontext.Context, string, string) (net.Conn, error)) {
+	p.dialContext = func(ctx gocontext.Context, a, b string) (net.Conn, error) {
+		c, e := dialContext(ctx, a, b)
 		nosigpipe.IgnoreSIGPIPE(c)
 		return c, e
 	}
 
 	if tr, ok := p.roundTripper.(*http.Transport); ok {
-		tr.Dial = p.dial
+		tr.DialContext = p.dialContext
 	}
 }
 
@@ -137,25 +142,13 @@ func (p *Proxy) SetDial(dial func(string, string) (net.Conn, error)) {
 // finishes processing any inflight requests, and closes existing connections without
 // reading anymore requests from them.
 func (p *Proxy) Close() {
-	log.Infof("martian: closing down proxy")
-
-	close(p.closing)
-
-	log.Infof("martian: waiting for connections to close")
-	p.connsMu.Lock()
-	p.conns.Wait()
-	p.connsMu.Unlock()
-	log.Infof("martian: all connections closed")
+	log.Errorf("fcjr-martian: Close() deprecated, does nothing")
 }
 
 // Closing returns whether the proxy is in the closing state.
 func (p *Proxy) Closing() bool {
-	select {
-	case <-p.closing:
-		return true
-	default:
-		return false
-	}
+	log.Errorf("fcjr-martian: Closing() deprecated, always returns false")
+	return false
 }
 
 // SetRequestModifier sets the request modifier.
@@ -176,56 +169,85 @@ func (p *Proxy) SetResponseModifier(resmod ResponseModifier) {
 	p.resmod = resmod
 }
 
-// Serve accepts connections from the listener and handles the requests.
-func (p *Proxy) Serve(l net.Listener) error {
-	defer l.Close()
-
-	var delay time.Duration
-	for {
-		if p.Closing() {
-			return nil
-		}
-
-		conn, err := l.Accept()
-		nosigpipe.IgnoreSIGPIPE(conn)
-		if err != nil {
-			if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
-				if delay == 0 {
-					delay = 5 * time.Millisecond
-				} else {
-					delay *= 2
-				}
-				if max := time.Second; delay > max {
-					delay = max
-				}
-
-				log.Debugf("martian: temporary error on accept: %v", err)
-				time.Sleep(delay)
-				continue
-			}
-
-			log.Errorf("martian: failed to accept: %v", err)
-			return err
-		}
-		delay = 0
-		log.Debugf("martian: accepted connection from %s", conn.RemoteAddr())
-
-		if tconn, ok := conn.(*net.TCPConn); ok {
-			tconn.SetKeepAlive(true)
-			tconn.SetKeepAlivePeriod(3 * time.Minute)
-		}
-
-		go p.handleLoop(conn)
+func ctxIsDone(gctx gocontext.Context) bool {
+	select {
+	case <-gctx.Done():
+		return true
+	default:
+		return false
 	}
 }
 
-func (p *Proxy) handleLoop(conn net.Conn) {
-	p.connsMu.Lock()
-	p.conns.Add(1)
-	p.connsMu.Unlock()
-	defer p.conns.Done()
+// Serve accepts connections from the listener and handles the requests.
+func (p *Proxy) Serve(l net.Listener) error {
+	return p.ServeContext(gocontext.Background(), l, nil)
+}
+
+// Serve accepts connections from the listener and provides a custom handler to
+// handle each connection.
+func (p *Proxy) ServeContext(gctx gocontext.Context, l net.Listener, handler func(gocontext.Context, net.Conn)) error {
+	defer l.Close()
+
+	if handler == nil {
+		handler = p.HandleConn
+	}
+
+	connc := make(chan net.Conn)
+	errc := make(chan error)
+
+	go func() {
+		var delay time.Duration
+		for {
+			conn, err := l.Accept()
+			nosigpipe.IgnoreSIGPIPE(conn)
+			if err != nil {
+				if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
+					if delay == 0 {
+						delay = 5 * time.Millisecond
+					} else {
+						delay *= 2
+					}
+					if max := time.Second; delay > max {
+						delay = max
+					}
+
+					log.Debugf("martian: temporary error on accept: %v", err)
+					time.Sleep(delay)
+					continue
+				}
+
+				errc <- err
+				return
+			}
+			delay = 0
+			log.Debugf("martian: accepted connection from %s", conn.RemoteAddr())
+			connc <- conn
+		}
+	}()
+
+	for {
+		select {
+		case <-gctx.Done():
+			log.Debugf("martian: closing conn")
+			return nil
+		case err := <-errc:
+			log.Errorf("martian: failed to accept: %v", err)
+			return err
+		case conn := <-connc:
+			go handler(gctx, conn)
+		}
+	}
+}
+
+func (p *Proxy) HandleConn(gctx gocontext.Context, conn net.Conn) {
 	defer conn.Close()
-	if p.Closing() {
+
+	if tconn, ok := conn.(*net.TCPConn); ok {
+		tconn.SetKeepAlive(true)
+		tconn.SetKeepAlivePeriod(3 * time.Minute)
+	}
+
+	if ctxIsDone(gctx) {
 		return
 	}
 
@@ -247,14 +269,14 @@ func (p *Proxy) handleLoop(conn net.Conn) {
 		deadline := time.Now().Add(p.timeout)
 		conn.SetDeadline(deadline)
 
-		if err := p.handle(ctx, conn, brw); isCloseable(err) {
+		if err := p.handle(gctx, ctx, conn, brw); isCloseable(err) {
 			log.Debugf("martian: closing connection: %v", conn.RemoteAddr())
 			return
 		}
 	}
 }
 
-func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error {
+func (p *Proxy) handle(gctx gocontext.Context, ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error {
 	log.Debugf("martian: waiting for request: %v", conn.RemoteAddr())
 
 	var req *http.Request
@@ -280,7 +302,7 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 
 		return errClose
 	case req = <-reqc:
-	case <-p.closing:
+	case <-gctx.Done():
 		return errClose
 	}
 	defer req.Body.Close()
@@ -291,6 +313,8 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 		log.Errorf("martian: failed to build new context: %v", err)
 		return err
 	}
+
+	req = req.WithContext(gctx)
 
 	link(req, ctx)
 	defer unlink(req)
@@ -375,12 +399,12 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 				}
 				brw.Writer.Reset(finalTLSconn)
 				brw.Reader.Reset(finalTLSconn)
-				return p.handle(ctx, finalTLSconn, brw)
+				return p.handle(gctx, ctx, finalTLSconn, brw)
 			}
 
 			// Prepend the previously read data to be read again by http.ReadRequest.
 			brw.Reader.Reset(io.MultiReader(bytes.NewReader(b), bytes.NewReader(buf), conn))
-			return p.handle(ctx, conn, brw)
+			return p.handle(gctx, ctx, conn, brw)
 		}
 
 		log.Debugf("martian: attempting to establish CONNECT tunnel: %s", req.URL.Host)
@@ -479,7 +503,7 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 	}
 
 	var closing error
-	if req.Close || res.Close || p.Closing() {
+	if req.Close || res.Close || ctxIsDone(gctx) {
 		log.Debugf("martian: received close request: %v", req.RemoteAddr)
 		res.Close = true
 		closing = errClose
@@ -566,7 +590,7 @@ func (p *Proxy) connect(req *http.Request) (*http.Response, net.Conn, error) {
 	if p.proxyURL != nil {
 		log.Debugf("martian: CONNECT with downstream proxy: %s", p.proxyURL.Host)
 
-		conn, err := p.dial("tcp", p.proxyURL.Host)
+		conn, err := p.dialContext(req.Context(), "tcp", p.proxyURL.Host)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -586,7 +610,7 @@ func (p *Proxy) connect(req *http.Request) (*http.Response, net.Conn, error) {
 
 	log.Debugf("martian: CONNECT to host directly: %s", req.URL.Host)
 
-	conn, err := p.dial("tcp", req.URL.Host)
+	conn, err := p.dialContext(req.Context(), "tcp", req.URL.Host)
 	if err != nil {
 		return nil, nil, err
 	}
