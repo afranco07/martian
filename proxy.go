@@ -272,7 +272,6 @@ func (p *Proxy) HandleConn(gctx gocontext.Context, conn net.Conn) {
 		conn.SetDeadline(deadline)
 
 		if err := p.handle(gctx, ctx, conn, brw); isCloseable(err) {
-			p.OnClosedConnectionError(err)
 			log.Debugf("martian: closing connection: %v", conn.RemoteAddr())
 			return
 		}
@@ -303,6 +302,7 @@ func (p *Proxy) handle(gctx gocontext.Context, ctx *Context, conn net.Conn, brw 
 
 		// TODO: TCPConn.WriteClose() to avoid sending an RST to the client.
 
+		p.OnClosedConnectionError(err)
 		return errClose
 	case req = <-reqc:
 	case <-gctx.Done():
