@@ -61,7 +61,7 @@ type Proxy struct {
 	mitm         *mitm.Config
 	proxyURL     *url.URL
 
-	onClosedConnectionError func(error)
+	onClosedConnectionError func(gocontext.Context, string, error)
 
 	reqmod RequestModifier
 	resmod ResponseModifier
@@ -297,12 +297,16 @@ func (p *Proxy) handle(gctx gocontext.Context, ctx *Context, conn net.Conn, brw 
 		if isCloseable(err) {
 			log.Debugf("martian: connection closed prematurely: %v", err)
 		} else {
+			if c, ok := conn.(*tls.Conn); ok {
+				connectionState := c.ConnectionState()
+				serverName := connectionState.ServerName
+				p.onClosedConnectionError(gctx, serverName, err)
+			}
 			log.Errorf("martian: failed to read request: %v", err)
 		}
 
 		// TODO: TCPConn.WriteClose() to avoid sending an RST to the client.
 
-		p.OnClosedConnectionError(err)
 		return errClose
 	case req = <-reqc:
 	case <-gctx.Done():
@@ -621,12 +625,12 @@ func (p *Proxy) connect(req *http.Request) (*http.Response, net.Conn, error) {
 	return proxyutil.NewResponse(200, nil, req), conn, nil
 }
 
-func (p *Proxy) SetOnClosedConnectionError(cb func(error)) {
+func (p *Proxy) SetOnClosedConnectionError(cb func(gocontext.Context, string, error)) {
 	p.onClosedConnectionError = cb
 }
 
-func (p *Proxy) OnClosedConnectionError(err error) {
+func (p *Proxy) OnClosedConnectionError(ctx gocontext.Context, serverName string, err error) {
 	if p.onClosedConnectionError != nil {
-		p.onClosedConnectionError(err)
+		p.onClosedConnectionError(ctx, serverName, err)
 	}
 }
