@@ -300,7 +300,7 @@ func (p *Proxy) handle(gctx gocontext.Context, ctx *Context, conn net.Conn, brw 
 			if c, ok := conn.(*tls.Conn); ok {
 				connectionState := c.ConnectionState()
 				serverName := connectionState.ServerName
-				p.onClosedConnectionError(gctx, serverName, err)
+				p.OnClosedConnectionError(gctx, serverName, err)
 			}
 			log.Errorf("martian: failed to read request: %v", err)
 		}
