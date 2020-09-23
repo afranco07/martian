@@ -61,7 +61,7 @@ type Proxy struct {
 	mitm         *mitm.Config
 	proxyURL     *url.URL
 
-	onClosedConnectionError func(gocontext.Context, string, error)
+	onTLSClosedConnectionError func(gocontext.Context, string, error)
 
 	reqmod RequestModifier
 	resmod ResponseModifier
@@ -300,7 +300,9 @@ func (p *Proxy) handle(gctx gocontext.Context, ctx *Context, conn net.Conn, brw 
 			if c, ok := conn.(*tls.Conn); ok {
 				connectionState := c.ConnectionState()
 				serverName := connectionState.ServerName
-				p.OnClosedConnectionError(gctx, serverName, err)
+				if p.onTLSClosedConnectionError != nil {
+					p.onTLSClosedConnectionError(gctx, serverName, err)
+				}
 			}
 			log.Errorf("martian: failed to read request: %v", err)
 		}
@@ -626,11 +628,5 @@ func (p *Proxy) connect(req *http.Request) (*http.Response, net.Conn, error) {
 }
 
 func (p *Proxy) SetOnClosedConnectionError(cb func(gocontext.Context, string, error)) {
-	p.onClosedConnectionError = cb
-}
-
-func (p *Proxy) OnClosedConnectionError(ctx gocontext.Context, serverName string, err error) {
-	if p.onClosedConnectionError != nil {
-		p.onClosedConnectionError(ctx, serverName, err)
-	}
+	p.onTLSClosedConnectionError = cb
 }
