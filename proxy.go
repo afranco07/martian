@@ -17,6 +17,7 @@ package martian
 import (
 	"bufio"
 	"bytes"
+	gocontext "context"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -26,7 +27,6 @@ import (
 	"net/url"
 	"regexp"
 	"time"
-	gocontext "context"
 
 	"github.com/google/martian/v3/log"
 	"github.com/google/martian/v3/mitm"
@@ -60,6 +60,8 @@ type Proxy struct {
 	timeout      time.Duration
 	mitm         *mitm.Config
 	proxyURL     *url.URL
+
+	onTLSClosedConnectionError func(gocontext.Context, string, error)
 
 	reqmod RequestModifier
 	resmod ResponseModifier
@@ -295,6 +297,13 @@ func (p *Proxy) handle(gctx gocontext.Context, ctx *Context, conn net.Conn, brw 
 		if isCloseable(err) {
 			log.Debugf("martian: connection closed prematurely: %v", err)
 		} else {
+			if c, ok := conn.(*tls.Conn); ok {
+				connectionState := c.ConnectionState()
+				serverName := connectionState.ServerName
+				if p.onTLSClosedConnectionError != nil {
+					p.onTLSClosedConnectionError(gctx, serverName, err)
+				}
+			}
 			log.Errorf("martian: failed to read request: %v", err)
 		}
 
@@ -616,4 +625,8 @@ func (p *Proxy) connect(req *http.Request) (*http.Response, net.Conn, error) {
 	}
 
 	return proxyutil.NewResponse(200, nil, req), conn, nil
+}
+
+func (p *Proxy) SetOnClosedConnectionError(cb func(gocontext.Context, string, error)) {
+	p.onTLSClosedConnectionError = cb
 }
