@@ -299,7 +299,12 @@ func (p *Proxy) handle(gctx gocontext.Context, ctx *Context, conn net.Conn, brw 
 		} else {
 			if c, ok := conn.(*tls.Conn); ok {
 				connectionState := c.ConnectionState()
+
 				serverName := connectionState.ServerName
+				if serverName == "" {
+					serverName = c.RemoteAddr().String()
+				}
+
 				if p.onTLSClosedConnectionError != nil {
 					p.onTLSClosedConnectionError(gctx, serverName, err)
 				}
